@@ -43,9 +43,6 @@
 2.  Подписывается на топик `laboratory/greenhouse/luminosity`.
 3.  **Обработка сообщения (`on_message`):**
       * Считывает значение `luminosity_val`.
-      * **Управление:**
-          * Если $\text{luminosity\_val} < \text{THRESHOLD}$ (1000) **и** светодиод не включен (`current_led_state != "on"`), отправляет команду `'u'` (включить) МК.
-          * Если $\text{luminosity\_val} \ge \text{THRESHOLD}$ (1000) **и** светодиод не выключен (`current_led_state != "off"`), отправляет команду `'d'` (выключить) МК.
       * Публикует статус, включая команду и ответ МК.
 
 #### 3.3. `monitor_script.py` (Монитор)
