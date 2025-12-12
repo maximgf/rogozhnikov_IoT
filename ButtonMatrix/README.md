@@ -1,158 +1,70 @@
-#include <avr/interrupt.h>
+https://www.tinkercad.com/things/jkaeBYvRyx5/editel?sharecode=Q8CAqnMIYokrBGfSdzdtmxvNRrJi4Q-VEu7K2IPrabY
 
-// --- Конфигурация матрицы ---
-#define ROW_COUNT 3
-#define COL_COUNT 3
-#define TOTAL_KEYS (ROW_COUNT * COL_COUNT)
+## 1. Общее описание
+Система реализует неблокирующий опрос клавиатуры с использованием **аппаратного таймера**. Это позволяет основному циклу `loop()` заниматься обработкой логики, в то время как сканирование и фильтрация дребезга контактов происходят в фоновом режиме (прерываниях).
 
-// --- Тайминги ---
-#define SCAN_PERIOD_MS 10
-#define DEBOUNCE_THRESHOLD 3
 
-// Данные для антидребезга и состояний (volatile для ISR)
-volatile uint8_t keyDebounceCounters[TOTAL_KEYS] = {0};
-volatile bool keyRawStates[TOTAL_KEYS] = {false};
-volatile bool keyStableStates[TOTAL_KEYS] = {false};
-volatile bool keyCurrentBuffer[TOTAL_KEYS] = {false};
 
-// Переменные для логики нажатий в основном цикле
-bool keyPreviousStates[TOTAL_KEYS] = {false};
-unsigned long keyPressStartTime[TOTAL_KEYS] = {0};
+---
 
-volatile uint8_t activeRowIndex = 0;
-volatile bool isScanCycleFinished = false;
+## 2. Конфигурация оборудования (Pinout)
 
-void setup() {
-  Serial.begin(9600);
-  
-  // Настройка строк (D2-D4) на выход
-  DDRD |= (1 << DDD2) | (1 << DDD3) | (1 << DDD4);
-  PORTD |= (1 << PORTD2) | (1 << PORTD3) | (1 << PORTD4);
-  
-  // Настройка столбцов (D5-D7) на вход с подтяжкой
-  DDRD &= ~((1 << DDD5) | (1 << DDD6) | (1 << DDD7));
-  PORTD |= (1 << PORTD5) | (1 << PORTD6) | (1 << PORTD7);
-  
-  initTimer1();
-  Serial.println("Matrix Keyboard Initialized");
-}
+Программа использует прямую работу с регистрами порта **D** (Digital pins 0-7).
 
-// Настройка аппаратного таймера для сканирования
-void initTimer1() {
-  TCCR1A = 0;
-  TCCR1B = 0;
-  TCNT1 = 0;
-  TCCR1B |= (1 << WGM12); // CTC mode
-  
-  // Расчет порога для 10мс при прерывателе 256
-  uint16_t compareValue = (F_CPU / 256) * SCAN_PERIOD_MS / 1000 - 1;
-  OCR1A = compareValue;
-  
-  TCCR1B |= (1 << CS12);  // Prescaler 256
-  TIMSK1 |= (1 << OCIE1A); // Enable interrupt
-  sei();
-}
+| Тип линии | Пины Arduino | Режим | Логика |
+| :--- | :--- | :--- | :--- |
+| **Строки (Rows)** | D2, D3, D4 | Выход (OUTPUT) | Активный уровень — **LOW** |
+| **Столбцы (Cols)** | D5, D6, D7 | Вход (INPUT_PULLUP) | Ожидает **LOW** при нажатии |
 
-// Прерывание таймера: сканирование одной строки за раз
-ISR(TIMER1_COMPA_vect) {
-  const uint8_t rowPins[] = { (1 << PORTD2), (1 << PORTD3), (1 << PORTD4) };
-  const uint8_t colPins[] = { (1 << PIND5), (1 << PIND6), (1 << PIND7) };
-  
-  // Сброс всех строк (HIGH) и активация текущей (LOW)
-  PORTD |= rowPins[0] | rowPins[1] | rowPins[2];
-  PORTD &= ~rowPins[activeRowIndex];
-  
-  // Короткая пауза для стабилизации сигнала
-  asm volatile("nop\nnop\nnop\nnop");
-  
-  uint8_t pinSnapshot = PIND;
-  
-  for (uint8_t col = 0; col < COL_COUNT; col++) {
-    uint8_t keyIdx = col + COL_COUNT * activeRowIndex;
-    bool isPressed = !(pinSnapshot & colPins[col]);
-    
-    // Алгоритм фильтрации дребезга
-    if (isPressed == keyRawStates[keyIdx]) {
-      if (keyDebounceCounters[keyIdx] < DEBOUNCE_THRESHOLD) {
-        keyDebounceCounters[keyIdx]++;
-      }
-      if (keyDebounceCounters[keyIdx] >= DEBOUNCE_THRESHOLD) {
-        keyStableStates[keyIdx] = isPressed;
-      }
-    } else {
-      keyDebounceCounters[keyIdx] = 0;
-      keyRawStates[keyIdx] = isPressed;
-    }
-  }
-  
-  // Переход к следующей строке или завершение цикла
-  activeRowIndex++;
-  if (activeRowIndex >= ROW_COUNT) {
-    activeRowIndex = 0;
-    for (uint8_t i = 0; i < TOTAL_KEYS; i++) {
-      keyCurrentBuffer[i] = keyStableStates[i];
-    }
-    isScanCycleFinished = true;
-  }
-}
+---
 
-void loop() {
-  if (!isScanCycleFinished) return;
-  
-  // Атомарное копирование данных из ISR
-  cli();
-  isScanCycleFinished = false;
-  bool localSnapshot[TOTAL_KEYS];
-  for (uint8_t i = 0; i < TOTAL_KEYS; i++) {
-    localSnapshot[i] = keyCurrentBuffer[i];
-  }
-  sei();
-  
-  unsigned long now = millis();
-  bool hasChanges = false;
-  
-  // Обработка событий нажатия и отпускания
-  for (uint8_t i = 0; i < TOTAL_KEYS; i++) {
-    if (localSnapshot[i] != keyPreviousStates[i]) {
-      hasChanges = true;
-      
-      if (localSnapshot[i]) {
-        keyPressStartTime[i] = now; // Засекаем начало нажатия
-      } else {
-        // Вычисляем длительность при отпускании
-        unsigned long duration = now - keyPressStartTime[i];
-        logRelease(i + 1, duration, keyPressStartTime[i]);
-      }
-      keyPreviousStates[i] = localSnapshot[i];
-    }
-  }
-  
-  if (hasChanges) {
-    logPressedKeys(localSnapshot);
-  }
-}
+## 3. Алгоритм работы
 
-// Вывод списка всех зажатых кнопок
-void logPressedKeys(bool* states) {
-  bool found = false;
-  Serial.print("Active: ");
-  for (uint8_t i = 0; i < TOTAL_KEYS; i++) {
-    if (states[i]) {
-      if (found) Serial.print(", ");
-      Serial.print(i + 1);
-      found = true;
-    }
-  }
-  if (!found) Serial.print("none");
-  Serial.println();
-}
+### А. Сканирование (Таймер 1)
+Таймер настроен в режим **CTC** (Clear Timer on Compare Match).
+* **Период:** каждые 10 мс (`SCAN_PERIOD_MS`).
+* **Метод:** За одно прерывание сканируется **одна строка**. Полный цикл опроса всей матрицы (3 строки) занимает 30 мс.
+* **Стабилизация:** Используются ассемблерные вставки `nop` для компенсации емкости линии после переключения состояния порта.
 
-// Вывод отчета о завершенном клике
-void logRelease(uint8_t id, unsigned long ms, unsigned long start) {
-  Serial.print("Key ");
-  Serial.print(id);
-  Serial.print(" | Duration: ");
-  Serial.print(ms);
-  Serial.print("ms | Start: ");
-  Serial.println(start);
-}
+### Б. Антидребезг (Debounce)
+Алгоритм основан на счетчиках стабильных состояний:
+1. Система считывает физическое состояние пина.
+2. Если состояние совпадает с предыдущим, счетчик `keyDebounceCounters` увеличивается.
+3. Состояние считается валидным («стабильным») только после того, как оно подтвердилось 3 раза подряд (`DEBOUNCE_THRESHOLD`).
+4. При любом изменении физического уровня счетчик сбрасывается.
+
+### В. Обработка событий
+В основном цикле `loop()` реализован механизм событий:
+* **Нажатие:** фиксируется время начала (timestamp).
+* **Отпускание:** вычисляется общая длительность удержания кнопки в миллисекундах.
+* **Атомарность:** Передача данных из прерывания в основной цикл защищена временным отключением прерываний (`cli()` / `sei()`), что предотвращает искажение данных (race condition).
+
+---
+
+## 4. Описание ключевых функций
+
+### `initTimer1()`
+Настраивает 16-битный таймер. 
+* Устанавливает предделитель (prescaler) на 256.
+* Рассчитывает значение `OCR1A` по формуле: 
+    $$OCR1A = \frac{F_{CPU}}{Prescaler} \cdot \text{Period} - 1$$
+
+### `ISR(TIMER1_COMPA_vect)`
+Обработчик прерывания. Выполняет:
+1. Подачу LOW на текущую строку.
+2. Чтение порта D и маскирование бит столбцов.
+3. Обновление программных счетчиков антидребезга.
+4. Переключение индекса активной строки для следующего вызова.
+
+### `logRelease(id, ms, start)`
+Выводит в последовательный порт отчет о завершенном клике.
+* **id:** Номер кнопки (1–9).
+* **ms:** Сколько времени была зажата.
+* **start:** Время нажатия относительно запуска МК.
+
+---
+
+## 5. Формат вывода в Serial
+При взаимодействии с клавиатурой в консоль выводятся данные двух типов:
+1. **Текущее состояние:** `Active: 1, 5` (если зажаты первая и пятая кнопки).
+2. **Отчет о клике:** `Key 3 | Duration: 450ms | Start: 12400` (выводится в момент отпускания).
