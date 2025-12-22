@@ -1,4 +1,4 @@
-// --- КОНФИГУРАЦИЯ ---
+//  КОНФИГУРАЦИЯ 
 #define PIN_RX 2       // Вход (Interrupt 0)
 #define PIN_TX 3       // Выход
 #define PIN_DATA 9     // 74HC595 DS
@@ -6,7 +6,7 @@
 #define PIN_CLOCK 11   // 74HC595 SH_CP
 #define PIN_LED 13     // Индикация передачи
 
-// --- ВРЕМЕННЫЕ ПАРАМЕТРЫ (ms) ---
+//  ВРЕМЕННЫЕ ПАРАМЕТРЫ (ms) 
 const unsigned long TIME_UNIT = 100; // 1t
 const unsigned long DOT_TIME = TIME_UNIT;
 const unsigned long DASH_TIME = 3 * TIME_UNIT;
@@ -17,11 +17,11 @@ const unsigned long WORD_GAP = 7 * TIME_UNIT;    // Пауза между сло
 // Допуски для распознавания (tolerance)
 const unsigned long TOLERANCE = 50; 
 
-// --- МАРКЕРЫ ПРОТОКОЛА ---
+//  МАРКЕРЫ ПРОТОКОЛА 
 const String PROTOCOL_START = "-.-.-"; // Start of Transmission
 const String PROTOCOL_END = "...-.-";  // End of Work
 
-// --- ТАБЛИЦЫ ---
+//  ТАБЛИЦЫ 
 const char* MORSE_LETTERS[] = {
   ".-", "-...", "-.-.", "-..", ".", "..-.", "--.", "....", "..", // A-I
   ".---", "-.-", ".-..", "--", "-.", "---", ".--.", "--.-", ".-.", // J-R
@@ -31,9 +31,7 @@ const char* MORSE_NUMBERS[] = {
   "-----", ".----", "..---", "...--", "....-", ".....", "-....", "--...", "---..", "----." // 0-9
 };
 
-// Семисегментный шрифт (0-9, A-Z). Без DP.
-// A, B, C, D, E, F, G (MSB -> LSB: xGFEDCBA) - примерная карта для Common Cathode
-// Для упрощения используем стандартную кодировку
+// Семисегментный шрифт (0-9, A-Z)
 const byte SEG_FONT[] = {
   0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F, // 0-9
   0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71, 0x3D, 0x76, 0x06, 0x1E, // A-J
@@ -41,13 +39,13 @@ const byte SEG_FONT[] = {
   0x3E, 0x1C, 0x2A, 0x76, 0x6E, 0x5B                          // U-Z
 };
 
-// --- ПЕРЕМЕННЫЕ TX (Передатчик) ---
-char txBuffer[64];      // Кольцевой буфер
+//  ПЕРЕМЕННЫЕ TX (Передатчик) 
+char txBuffer[64];      
 int txHead = 0;
 int txTail = 0;
 String currentMorseSeq = "";
 int txSeqIndex = 0;
-bool txFrameActive = false; // Отправляем ли мы сейчас кадр (между Start и End)
+bool txFrameActive = false; 
 unsigned long txLastTime = 0;
 
 enum TxState { 
@@ -63,7 +61,7 @@ enum TxState {
 TxState txState = TX_IDLE;
 TxState txReturnState = TX_IDLE; // Куда вернуться после отправки символа
 
-// --- ПЕРЕМЕННЫЕ RX (Приемник) ---
+//  ПЕРЕМЕННЫЕ RX (Приемник) 
 volatile unsigned long rxPulseStart = 0;
 volatile unsigned long rxPulseWidth = 0;
 volatile bool rxPulseReady = false;
@@ -71,9 +69,8 @@ volatile unsigned long rxLastEdge = 0;
 
 String rxBufferSeq = ""; // Накопленные точки/тире
 unsigned long rxLastActivity = 0;
-bool rxFrameActive = false; // Принимаем ли мы полезную нагрузку
+bool rxFrameActive = false; 
 
-// --- SETUP ---
 void setup() {
   Serial.begin(9600);
   
@@ -89,12 +86,9 @@ void setup() {
   // Привязка прерывания к смене состояния на RX пине
   attachInterrupt(digitalPinToInterrupt(PIN_RX), rxISR, CHANGE);
   
-  // Тест дисплея
-  displayByte(0xFF); delay(200); displayByte(0x00);
   Serial.println("System Ready.");
 }
 
-// --- MAIN LOOP ---
 void loop() {
   handleSerialInput();
   runTransmitterFSM();
@@ -105,12 +99,11 @@ void loop() {
 void handleSerialInput() {
   while (Serial.available() > 0) {
     char c = Serial.read();
-    c = toupper(c); // Работаем только с верхним регистром
+    c = toupper(c); 
     
-    // Добавляем в буфер только допустимые символы
     if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ') {
       int nextHead = (txHead + 1) % 64;
-      if (nextHead != txTail) { // Если буфер не полон
+      if (nextHead != txTail) {
         txBuffer[txHead] = c;
         txHead = nextHead;
       }
@@ -118,7 +111,6 @@ void handleSerialInput() {
   }
 }
 
-// Получить следующий символ из буфера
 char peekTxBuffer() {
   if (txHead == txTail) return 0;
   return txBuffer[txTail];
@@ -130,7 +122,6 @@ void popTxBuffer() {
   }
 }
 
-// Перевод символа в строку Морзе
 String charToMorse(char c) {
   if (c >= 'A' && c <= 'Z') return String(MORSE_LETTERS[c - 'A']);
   if (c >= '0' && c <= '9') return String(MORSE_NUMBERS[c - '0']);
@@ -184,7 +175,7 @@ void runTransmitterFSM() {
       txState = TX_SIGNAL_HIGH;
       break;
 
-    // --- Начало импульса ---
+    // Начало импульса
     case TX_SIGNAL_HIGH:
       {
         if (txSeqIndex >= currentMorseSeq.length()) {
@@ -203,7 +194,7 @@ void runTransmitterFSM() {
       }
       break;
 
-    // --- Ожидание окончания импульса (High duration) ---
+    //  Ожидание окончания импульса (High duration) 
     case TX_WAIT_HIGH: 
       {
         char signal = currentMorseSeq[txSeqIndex];
@@ -219,7 +210,7 @@ void runTransmitterFSM() {
       }
       break;
 
-    // --- Ожидание окончания паузы внутри символа (Low duration) ---
+    //  Ожидание окончания паузы внутри символа (Low duration) 
     case TX_WAIT_LOW: 
       if (currentMillis - txLastTime >= SYMBOL_GAP) {
         txSeqIndex++;
@@ -235,10 +226,7 @@ void runTransmitterFSM() {
   }
 }
 
-// ==========================================
-//              LOGIC: RX (RECEIVER)
-// ==========================================
-
+// RX
 // ISR (Interrupt Service Routine)
 void rxISR() {
   unsigned long now = millis();
@@ -305,7 +293,7 @@ void displayChar(char c) {
 
 void displayByte(byte data) {
   digitalWrite(PIN_LATCH, LOW);
-  shiftOut(PIN_DATA, PIN_CLOCK, MSBFIRST, data); // Инверсия если общий анод - добавить ~data
+  shiftOut(PIN_DATA, PIN_CLOCK, MSBFIRST, data);
   digitalWrite(PIN_LATCH, HIGH);
 }
 
@@ -332,7 +320,6 @@ void runReceiverFSM() {
 
   // 2. Обработка пауз (таймауты)
   // Мы проверяем, сколько времени прошло с последнего изменения уровня (rxLastEdge)
-  // Важно: проверяем только если на линии LOW
   if (digitalRead(PIN_RX) == LOW && rxBufferSeq.length() > 0) {
     unsigned long timeSinceLastPulse = now - rxLastEdge;
 
@@ -346,9 +333,7 @@ void runReceiverFSM() {
   // Опционально: обнаружение паузы между словами (Word Gap)
   if (digitalRead(PIN_RX) == LOW && rxFrameActive) {
      if (now - rxLastEdge > WORD_GAP) {
-       // Можно вывести пробел в Serial, но дисплей просто останется с последней буквой
-       // Serial.print(" "); 
-       // Блокировать повторный пробел флагом, если нужно
+      Serial.print(" "); 
      }
   }
 }
