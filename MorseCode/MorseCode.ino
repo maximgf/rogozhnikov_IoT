@@ -1,8 +1,9 @@
 //  КОНФИГУРАЦИЯ 
-#define PIN_RX 2       // Вход (Interrupt 0)
+#define PIN_RX 2       // Вход
 #define PIN_TX 3       // Выход
+#define PIN_BUTTON 4   // Кнопка
 #define PIN_DATA 9     // 74HC595 DS
-#define PIN_LATCH 10    // 74HC595 ST_CP
+#define PIN_LATCH 10   // 74HC595 ST_CP
 #define PIN_CLOCK 11   // 74HC595 SH_CP
 #define PIN_LED 13     // Индикация передачи
 
@@ -13,15 +14,31 @@ const unsigned long DASH_TIME = 3 * TIME_UNIT;
 const unsigned long SYMBOL_GAP = TIME_UNIT;      // Пауза внутри буквы
 const unsigned long LETTER_GAP = 3 * TIME_UNIT;  // Пауза между буквами
 const unsigned long WORD_GAP = 7 * TIME_UNIT;    // Пауза между словами
+const unsigned long DEBOUNCE_DELAY = 50;         // Антидребезг
 
 // Допуски для распознавания (tolerance)
 const unsigned long TOLERANCE = 50; 
 
 //  МАРКЕРЫ ПРОТОКОЛА 
-const String PROTOCOL_START = "-.-.-"; // Start of Transmission
-const String PROTOCOL_END = "...-.-";  // End of Work
+const String PROTOCOL_START = "-.-.-";
+const String PROTOCOL_END = "...-.-"; 
 
-//  ТАБЛИЦЫ 
+//  Режимы и переменные 
+enum InputMode {
+  MODE_AUTO,      // Serial -> TX (FSM)
+  MODE_MANUAL,    // Button -> Logic -> TX (FSM)
+  MODE_RAW        // Button -> TX (Direct)
+};
+
+InputMode currentMode = MODE_AUTO;
+
+// Переменные для ручного ввода
+unsigned long buttonPressStart = 0;
+bool buttonPressed = false;      // Текущее логическое состояние нажатия
+bool buttonProcessed = false;    // Флаг, что нажатие уже обработано
+String manualMorseSeq = "";      // Накопление последовательности
+unsigned long lastButtonRelease = 0; // Для определения конца символа
+
 const char* MORSE_LETTERS[] = {
   ".-", "-...", "-.-.", "-..", ".", "..-.", "--.", "....", "..", // A-I
   ".---", "-.-", ".-..", "--", "-.", "---", ".--.", "--.-", ".-.", // J-R
@@ -31,7 +48,6 @@ const char* MORSE_NUMBERS[] = {
   "-----", ".----", "..---", "...--", "....-", ".....", "-....", "--...", "---..", "----." // 0-9
 };
 
-// Семисегментный шрифт (0-9, A-Z)
 const byte SEG_FONT[] = {
   0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F, // 0-9
   0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71, 0x3D, 0x76, 0x06, 0x1E, // A-J
@@ -39,13 +55,12 @@ const byte SEG_FONT[] = {
   0x3E, 0x1C, 0x2A, 0x76, 0x6E, 0x5B                          // U-Z
 };
 
-//  ПЕРЕМЕННЫЕ TX (Передатчик) 
-char txBuffer[64];      
+//  ПЕРЕМЕННЫЕ TX 
+char txBuffer[64];
 int txHead = 0;
 int txTail = 0;
 String currentMorseSeq = "";
 int txSeqIndex = 0;
-bool txFrameActive = false; 
 unsigned long txLastTime = 0;
 
 enum TxState { 
@@ -59,17 +74,21 @@ enum TxState {
   TX_NEXT_CHAR_WAIT 
 };
 TxState txState = TX_IDLE;
-TxState txReturnState = TX_IDLE; // Куда вернуться после отправки символа
+TxState txReturnState = TX_IDLE;
 
-//  ПЕРЕМЕННЫЕ RX (Приемник) 
+//  ПЕРЕМЕННЫЕ RX 
 volatile unsigned long rxPulseStart = 0;
 volatile unsigned long rxPulseWidth = 0;
 volatile bool rxPulseReady = false;
 volatile unsigned long rxLastEdge = 0;
-
-String rxBufferSeq = ""; // Накопленные точки/тире
+String rxBufferSeq = ""; 
 unsigned long rxLastActivity = 0;
 bool rxFrameActive = false; 
+
+//  ФУНКЦИИ 
+void rxISR(); 
+void displayByte(byte data);
+void displayChar(char c);
 
 void setup() {
   Serial.begin(9600);
@@ -80,37 +99,175 @@ void setup() {
   pinMode(PIN_DATA, OUTPUT);
   pinMode(PIN_LATCH, OUTPUT);
   pinMode(PIN_CLOCK, OUTPUT);
+  
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
 
   digitalWrite(PIN_TX, LOW);
   
-  // Привязка прерывания к смене состояния на RX пине
   attachInterrupt(digitalPinToInterrupt(PIN_RX), rxISR, CHANGE);
   
-  Serial.println("System Ready.");
+  Serial.println("System Ready. Modes: !A (Auto), !M (Manual), !R (Raw)");
 }
 
-void loop() {
-  handleSerialInput();
-  runTransmitterFSM();
-  runReceiverFSM();
+//  Чтение кнопки с Debounce 
+bool readButtonDebounced() {
+  static unsigned long lastDebounceTime = 0;
+  static bool lastButtonState = HIGH;
+  static bool buttonState = HIGH;
+  
+  bool reading = digitalRead(PIN_BUTTON);
+
+  // Если состояние изменилось
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
+    // Если состояние стабильно дольше задержки
+    if (reading != buttonState) {
+      buttonState = reading;
+    }
+  }
+
+  lastButtonState = reading;
+  
+  // Возвращаем true, если кнопка нажата (LOW из-за pullup)
+  return (buttonState == LOW);
 }
 
+// Вспомогательная функция для отправки ручной последовательности через FSM
+void sendManualMorse(String sequence) {
+  // Если передатчик занят, игнорируем (или можно добавить в очередь, но здесь упрощаем)
+  if (txState != TX_IDLE) return;
+  
+  Serial.print("Sending Manual: "); Serial.println(sequence);
+  
+  currentMorseSeq = sequence;
+  txSeqIndex = 0;
+  
+  // Принудительно запускаем FSM на передачу этого символа
+  txLastTime = millis();
+  txState = TX_SIGNAL_HIGH;
+  txReturnState = TX_IDLE;
+}
+
+//  Обработка Manual режима 
+void handleManualMode() {
+  bool isPressed = readButtonDebounced();
+  unsigned long now = millis();
+  
+  // Обработка начала нажатия
+  if (isPressed && !buttonPressed) {
+    buttonPressed = true;
+    buttonPressStart = now;
+    digitalWrite(PIN_LED, HIGH); // Визуальная индикация ввода
+  }
+  
+  // Обработка отпускания (конец ввода точки/тире)
+  if (!isPressed && buttonPressed) {
+    buttonPressed = false;
+    unsigned long duration = now - buttonPressStart;
+    digitalWrite(PIN_LED, LOW);
+    
+    // Определение точки или тире
+    if (duration < 300) {
+      manualMorseSeq += ".";
+    } else {
+      manualMorseSeq += "-";
+    }
+    
+    lastButtonRelease = now;
+    Serial.print("Buf: "); Serial.println(manualMorseSeq);
+  }
+  
+  // Обработка паузы (отправка символа)
+  // Если кнопка отпущена, буфер не пуст и прошло время межсимвольной паузы
+  if (!isPressed && manualMorseSeq.length() > 0) {
+    if (now - lastButtonRelease > LETTER_GAP) {
+      sendManualMorse(manualMorseSeq);
+      manualMorseSeq = ""; // Очистить локальный буфер
+    }
+  }
+}
+
+//  Обработка Raw режима 
+void handleRawMode() {
+  // Прямое чтение кнопки (с дебаунсом, чтобы убрать шум контактов)
+  bool isPressed = readButtonDebounced();
+  
+  // Прямая передача на TX 
+  // isPressed = true, значит хотим HIGH на выходе
+  digitalWrite(PIN_TX, isPressed ? HIGH : LOW);
+  
+  // Индикация
+  digitalWrite(PIN_LED, isPressed ? HIGH : LOW);
+}
+
+//  Переключение режимов через Serial 
+// Добавьте эту переменную в начало кода к остальным глобальным переменным
+bool isSettingMode = false; 
 
 void handleSerialInput() {
   while (Serial.available() > 0) {
     char c = Serial.read();
-    c = toupper(c); 
-    
-    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ') {
-      int nextHead = (txHead + 1) % 64;
-      if (nextHead != txTail) {
-        txBuffer[txHead] = c;
-        txHead = nextHead;
+
+    // 1. Проверка на префикс команды
+    if (c == '!') {
+      isSettingMode = true;
+      continue; // Ждем следующий символ в следующем проходе цикла
+    }
+
+    // 2. Если мы в процессе смены режима
+    if (isSettingMode) {
+      char mode = toupper(c);
+      bool modeChanged = true;
+
+      switch(mode) {
+        case 'A': 
+          currentMode = MODE_AUTO; 
+          Serial.println(F("Mode: AUTO")); 
+          break;
+        case 'M': 
+          currentMode = MODE_MANUAL; 
+          Serial.println(F("Mode: MANUAL (Sequence buffered)")); 
+          break;
+        case 'R': 
+          currentMode = MODE_RAW; 
+          digitalWrite(PIN_TX, LOW); // Сброс выхода при входе в RAW
+          Serial.println(F("Mode: RAW (Direct TX)")); 
+          break;
+        default:
+          Serial.println(F("Unknown Mode"));
+          modeChanged = false;
+      }
+
+      if (modeChanged) {
+        // Очистка всех буферов при смене режима для стабильности
+        manualMorseSeq = "";
+        txHead = txTail; 
+        txState = TX_IDLE;
+        digitalWrite(PIN_LED, LOW);
+      }
+
+      isSettingMode = false; // Выходим из режима настройки
+      continue;
+    }
+
+    // 3. Стандартная обработка текста для AUTO режима
+    if (currentMode == MODE_AUTO) {
+      c = toupper(c);
+      if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ') {
+        int nextHead = (txHead + 1) % 64;
+        if (nextHead != txTail) { 
+          txBuffer[txHead] = c;
+          txHead = nextHead;
+        }
       }
     }
   }
 }
 
+// Helper functions for TX FSM
 char peekTxBuffer() {
   if (txHead == txTail) return 0;
   return txBuffer[txTail];
@@ -128,6 +285,7 @@ String charToMorse(char c) {
   return ""; 
 }
 
+// TX FSM
 void runTransmitterFSM() {
   unsigned long currentMillis = millis();
 
@@ -143,6 +301,7 @@ void runTransmitterFSM() {
       txSeqIndex = 0;
       txReturnState = TX_SEND_PAYLOAD;
       txState = TX_SIGNAL_HIGH;
+      txLastTime = currentMillis;
       break;
 
     case TX_SEND_PAYLOAD:
@@ -165,6 +324,7 @@ void runTransmitterFSM() {
         popTxBuffer(); 
         txReturnState = TX_SEND_PAYLOAD; 
         txState = TX_SIGNAL_HIGH;
+        txLastTime = currentMillis;
       }
       break;
 
@@ -173,9 +333,9 @@ void runTransmitterFSM() {
       txSeqIndex = 0;
       txReturnState = TX_IDLE; 
       txState = TX_SIGNAL_HIGH;
+      txLastTime = currentMillis;
       break;
 
-    // Начало импульса
     case TX_SIGNAL_HIGH:
       {
         if (txSeqIndex >= currentMorseSeq.length()) {
@@ -186,15 +346,14 @@ void runTransmitterFSM() {
 
         char signal = currentMorseSeq[txSeqIndex];
         digitalWrite(PIN_TX, HIGH);
-        digitalWrite(PIN_LED, HIGH);
+        // В AUTO режиме LED управляется FSM, 
+        // В MANUAL режиме LED уже мигал при вводе, но при передаче можно дублировать
+        digitalWrite(PIN_LED, HIGH); 
         txLastTime = currentMillis;
-        
-        // Переходим в состояние ожидания конца высокого уровня
         txState = TX_WAIT_HIGH; 
       }
       break;
 
-    //  Ожидание окончания импульса (High duration) 
     case TX_WAIT_HIGH: 
       {
         char signal = currentMorseSeq[txSeqIndex];
@@ -204,17 +363,16 @@ void runTransmitterFSM() {
           digitalWrite(PIN_TX, LOW);
           digitalWrite(PIN_LED, LOW);
           txLastTime = currentMillis;
-          // Переходим в состояние ожидания паузы между точками/тире
           txState = TX_WAIT_LOW; 
         }
       }
       break;
 
-    //  Ожидание окончания паузы внутри символа (Low duration) 
     case TX_WAIT_LOW: 
       if (currentMillis - txLastTime >= SYMBOL_GAP) {
         txSeqIndex++;
-        txState = TX_SIGNAL_HIGH; // Возврат к следующему элементу знака
+        txState = TX_SIGNAL_HIGH; 
+        txLastTime = currentMillis;
       }
       break;
 
@@ -226,26 +384,51 @@ void runTransmitterFSM() {
   }
 }
 
-// RX
-// ISR (Interrupt Service Routine)
+//  Главный цикл 
+void loop() {
+  handleSerialInput();
+  
+  // Обработка входных устройств в зависимости от режима
+  switch(currentMode) {
+    case MODE_AUTO:
+      // Вход обрабатывается внутри handleSerialInput
+      break;
+      
+    case MODE_MANUAL:
+      handleManualMode();
+      break;
+      
+    case MODE_RAW:
+      handleRawMode();
+      break;
+  }
+  
+  // TX FSM запускается только если мы НЕ в raw режиме
+  // В RAW режиме мы управляем PIN_TX напрямую
+  if (currentMode != MODE_RAW) {
+    runTransmitterFSM();
+  }
+  
+  runReceiverFSM();
+}
+
+//  RX
+
 void rxISR() {
   unsigned long now = millis();
   int state = digitalRead(PIN_RX);
 
   if (state == LOW) { 
-    // Упал в LOW -> закончился импульс HIGH
     rxPulseWidth = now - rxPulseStart;
     rxPulseReady = true; 
     rxLastEdge = now;
   } else {
-    // Поднялся в HIGH -> начался импульс
     rxPulseStart = now;
     rxLastEdge = now;
   }
 }
 
 void decodeMorseChar(String seq) {
-  // Сначала проверяем служебные команды
   if (seq == PROTOCOL_START) {
     rxFrameActive = true;
     Serial.println("\n[RX] Frame START");
@@ -257,12 +440,15 @@ void decodeMorseChar(String seq) {
     return;
   }
 
-  // Если мы не в режиме приема кадра, игнорируем шум
-  if (!rxFrameActive) return;
+  if (!rxFrameActive && currentMode == MODE_AUTO) return; 
+  // Если хотим видеть символы в Raw режиме без заголовков протокола:
+  if (!rxFrameActive && currentMode == MODE_RAW) {
+     // Разрешаем декодирование в RAW режиме без фрейма для простоты теста
+  } else if (!rxFrameActive) {
+    return;
+  }
 
   char decoded = '?';
-  
-  // Поиск буквы
   for (int i = 0; i < 26; i++) {
     if (seq == MORSE_LETTERS[i]) {
       decoded = 'A' + i;
@@ -271,7 +457,6 @@ void decodeMorseChar(String seq) {
       return;
     }
   }
-  // Поиск цифры
   for (int i = 0; i < 10; i++) {
     if (seq == MORSE_NUMBERS[i]) {
       decoded = '0' + i;
@@ -286,54 +471,40 @@ void displayChar(char c) {
   byte segment = 0;
   if (c >= '0' && c <= '9') segment = SEG_FONT[c - '0'];
   else if (c >= 'A' && c <= 'Z') segment = SEG_FONT[10 + (c - 'A')];
-  else segment = 0b01000000; // Тире для неизвестных
+  else segment = 0b01000000; 
 
   displayByte(segment);
 }
 
 void displayByte(byte data) {
   digitalWrite(PIN_LATCH, LOW);
-  shiftOut(PIN_DATA, PIN_CLOCK, MSBFIRST, data);
+  shiftOut(PIN_DATA, PIN_CLOCK, MSBFIRST, data); 
   digitalWrite(PIN_LATCH, HIGH);
 }
 
 void runReceiverFSM() {
   unsigned long now = millis();
 
-  // 1. Обработка принятого импульса (из ISR)
   if (rxPulseReady) {
     noInterrupts();
     unsigned long width = rxPulseWidth;
     rxPulseReady = false;
     interrupts();
 
-    // Определяем точку или тире с учетом погрешности
     if (width > (DOT_TIME - TOLERANCE) && width < (DOT_TIME + TOLERANCE + 50)) {
       rxBufferSeq += ".";
     } else if (width > (DASH_TIME - TOLERANCE)) {
       rxBufferSeq += "-";
     }
-    // Иначе шум
-    
     rxLastActivity = now;
   }
 
-  // 2. Обработка пауз (таймауты)
-  // Мы проверяем, сколько времени прошло с последнего изменения уровня (rxLastEdge)
   if (digitalRead(PIN_RX) == LOW && rxBufferSeq.length() > 0) {
     unsigned long timeSinceLastPulse = now - rxLastEdge;
 
-    // Если прошло времени как на паузу между буквами -> декодируем
     if (timeSinceLastPulse > (LETTER_GAP - 50)) {
       decodeMorseChar(rxBufferSeq);
-      rxBufferSeq = ""; // Очистка
+      rxBufferSeq = ""; 
     }
-  }
-  
-  // Опционально: обнаружение паузы между словами (Word Gap)
-  if (digitalRead(PIN_RX) == LOW && rxFrameActive) {
-     if (now - rxLastEdge > WORD_GAP) {
-      Serial.print(" "); 
-     }
   }
 }
